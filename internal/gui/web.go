@@ -168,8 +168,30 @@ func (w *Web) Wait() error {
 	// the plugin hosts end, waited for, first: one still running at the
 	// exec is a child nothing waits for after it, <defunct> under this
 	// pid from then on (#3285)
-	plugin.EndHosts()
+	endHostsWithin(webEndHostsWait)
 	return update.Reexec(exe, os.Args[1:], append(os.Environ(), webRunKey+"="+w.key))
+}
+
+// webEndHostsWait bounds the hosts' end before the exec. EndHosts is
+// bounded itself (#6643); this is the backstop for anything else that
+// could hold it, since a restart that never reaches syscall.Exec leaves
+// the old process serving a port the new one needs.
+var webEndHostsWait = 5 * time.Second
+
+// endHostsWithin runs plugin.EndHosts, and returns when it is done or d
+// has passed. A host left running at the exec is at worst an orphan the
+// system reaps, where a restart that never happens holds the port.
+func endHostsWithin(d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		plugin.EndHosts()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		log.Printf("update: the plugin hosts didn't end in %s; going on to the new version", d)
+	}
 }
 
 // webKeyMin is the shortest MAGPIE_WEB_KEY taken: it is all that stands

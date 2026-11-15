@@ -539,6 +539,15 @@ var live = struct {
 // errHostsEnded is a host asked for once EndHosts has run.
 var errHostsEnded = errors.New("magpie is restarting; the plugins are back in a moment")
 
+// endHostsLockWait is how long EndHosts waits for hostMu before going on
+// without it. A start() holds hostMu across a whole host startup, whose
+// init is bounded at 2 minutes: waiting on it unboundedly held the update
+// restart past the point where it would have run the new version, so a
+// supervisor's SIGTERM found nothing to end and its SIGKILL ended magpie
+// instead. Nothing is lost by giving up on the lock: live.ended is already
+// set, so startOn refuses the host being started and any asked for after.
+var endHostsLockWait = 3 * time.Second
+
 // EndHosts stops every plugin host, waits until each has been waited for,
 // and starts none after: what magpie runs before it puts a new version in
 // its own place (update.Reexec). A host still running at the exec was one
@@ -554,9 +563,10 @@ func EndHosts() {
 		hs = append(hs, h)
 	}
 	live.Unlock()
-	hostMu.Lock()
-	current = nil
-	hostMu.Unlock()
+	// hostMu bounded: a start() in flight holds it for the whole of a
+	// host startup, and waiting for that here is what deadlocked the
+	// restart (#6643)
+	forgetCurrent()
 	var wg sync.WaitGroup
 	for _, h := range hs {
 		wg.Go(func() {
@@ -565,6 +575,29 @@ func EndHosts() {
 		})
 	}
 	wg.Wait()
+}
+
+// forgetCurrent drops the host calls go to, without waiting on hostMu
+// longer than endHostsLockWait. live.ended, which its callers set first,
+// is what keeps a host from being started anyway.
+func forgetCurrent() {
+	if hostMu.TryLock() {
+		current = nil
+		hostMu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		hostMu.Lock()
+		current = nil
+		hostMu.Unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(endHostsLockWait):
+		log.Printf("plugin: a host is still starting (%s on); ending the hosts without it", endHostsLockWait)
+	}
 }
 
 // quitErr is the error of a host whose child ended with err.
